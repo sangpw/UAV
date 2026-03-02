@@ -190,13 +190,13 @@ class HierarchicalUAVEnv:
 
         # 碰撞惩罚
         if self._check_collision(pos):
-            reward -= inf
+            reward -= 10000
             done = True
             print(f"  [Episode Done] Collision/Out of bounds! Pos: {pos}")
 
         # SOC耗尽
         if self.bat.SOC < 0.15:
-            reward -= 100.0
+            reward -= 10000
             done = True
             print(f"  [Episode Done] Battery depleted! SOC: {self.bat.SOC:.2f}")
 
