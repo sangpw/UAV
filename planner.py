@@ -1,10 +1,15 @@
 import numpy as np
-import torch
 import heapq
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, List
-from rl_core import Actor  ,ActorSAC# 复用rl_core中的Actor定义
+import math
+import torch
+from typing import List, Optional
+
+# 尝试导入 SAC 模型，如果不存在则通过，避免影响其他规划器运行
+try:
+    from rl_core import ActorSAC
+except ImportError:
+    # 仅作为静默处理，只有在实例化 SACPlanner 时才会报错
+    ActorSAC = None
 
 
 class BasePlanner:
@@ -18,236 +23,331 @@ class BasePlanner:
                                  power_state: dict,
                                  dt: float,
                                  future_trajectory: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        接口定义：所有子类必须匹配此参数列表
-        :param future_trajectory: (可选) 预测未来轨迹，用于MPC类算法
-        :return: 目标速度指令 [vx, vy, vz] (m/s)
-        """
         raise NotImplementedError
 
 
 class RuleBasedPlanner(BasePlanner):
     """
-    策略1: 基于规则的路径跟随 (P控制 + 简单避障)
+    基于规则的规划器 (人工势场法 + NED坐标系适配)
     """
 
-    def __init__(self, kp_pos: float = 1.0, kp_alt: float = 0.5, max_speed: float = 15.0):
-        self.kp_pos = kp_pos
-        self.kp_alt = kp_alt
+    def __init__(self, max_speed: float = 15.0, arrive_radius: float = 10.0):
         self.max_speed = max_speed
+        self.arrive_radius = arrive_radius
 
     def compute_velocity_command(self, current_pos, current_vel, target_pos, obstacles,
                                  power_state, dt, future_trajectory=None):
-        pos_error = target_pos - current_pos
-        dist = np.linalg.norm(pos_error)
-        if dist < 2.0: return np.zeros(3)
+        # 1. 吸引力 (飞向目标)
+        error = target_pos - current_pos
+        dist = np.linalg.norm(error)
 
-        v_cmd = pos_error * self.kp_pos
-        v_cmd[2] = pos_error[2] * self.kp_alt
+        if dist < self.arrive_radius:
+            return np.zeros(3)
 
-        # 简单的势场避障
+        # 比例控制
+        desired_vel = (error / dist) * self.max_speed
+
+        # 2. 斥力 (避障)
+        repulsive_force = np.zeros(3)
+
         for obs in obstacles:
-            obs_pos, obs_r = obs[:3], obs[3]
-            dist_vec = current_pos - obs_pos
-            dist_val = np.linalg.norm(dist_vec)
-            if dist_val < obs_r + 15.0:  # 避障半径
-                # 产生斥力
-                repulsion = (dist_vec / dist_val) * (1.0 / (dist_val - obs_r + 0.1)) * 50.0
-                v_cmd += repulsion
+            # 解析新环境的障碍物格式: [cx, cy, w, l, h]
+            cx, cy, w, l, h = obs
 
-        v_norm = np.linalg.norm(v_cmd[:2])
+            # 将长方体简化为圆柱体进行快速避障
+            # 半径取宽长的平均值的一半，再加一点余量
+            radius = (w + l) / 4.0
+            # 障碍物中心 (NED坐标系: z 从 0 到 -h)
+            # 我们关注水平避障
+            obs_center_2d = np.array([cx, cy])
+            curr_pos_2d = current_pos[:2]
+
+            dist_vec_2d = curr_pos_2d - obs_center_2d
+            dist_val_2d = np.linalg.norm(dist_vec_2d)
+
+            # 高度判断：如果无人机已经飞得比楼顶还高 (z < -h)，则不需要避障
+            # 注意 NED: z越小越高。例如 楼顶-100, 无人机-120.
+            # 加上 10m 的垂直安全余量
+            if current_pos[2] < (-h - 10.0):
+                continue
+
+            safe_dist = radius + 25.0  # 安全半径 (稍微加大一点)
+
+            if dist_val_2d < safe_dist:
+                # 产生水平斥力
+                rep_dir = dist_vec_2d / (dist_val_2d + 1e-6)
+                # 距离越近，斥力越大
+                strength = 4.0 * (safe_dist - dist_val_2d)
+                repulsive_force[:2] += rep_dir * strength
+
+        # 3. 合成速度
+        final_cmd = desired_vel + repulsive_force
+
+        # 4. 高度保持/限制
+        # 如果斥力太大导致合力偏离目标太远，稍微增加向上爬升的倾向以越过障碍
+        if np.linalg.norm(repulsive_force) > 5.0:
+            # NED: 负数是向上。尝试向上爬升避障
+            final_cmd[2] -= 3.0
+
+            # 5. 限速
+        v_norm = np.linalg.norm(final_cmd)
         if v_norm > self.max_speed:
-            v_cmd[:2] = v_cmd[:2] / v_norm * self.max_speed
-        v_cmd[2] = np.clip(v_cmd[2], -5, 5)
-        return np.clip(v_cmd, -self.max_speed, self.max_speed)
+            final_cmd = final_cmd / v_norm * self.max_speed
+
+        return final_cmd
 
 
 class AStarPlanner(BasePlanner):
     """
-    长方体避障版 A* Planner
+    适配 NED 坐标系与 3D 障碍物的稳健 A* 规划器
     """
 
-    def __init__(self, grid_res: float = 20.0, replan_interval: int = 20):
-        self.grid_res = grid_res
+    def __init__(self, grid_res: float = 20.0, replan_interval: int = 20, safety_margin: float = 10.0):
+        self.res = grid_res
         self.replan_interval = replan_interval
-        self.waypoints = []
-        self.current_wp_idx = 0
-        self.step_counter = 0
-        # 安全膨胀距离 (米)
-        self.safety_margin = 15.0
+        self.margin = safety_margin
 
-    def _heuristic(self, a, b):
-        return np.linalg.norm(a - b)
+        self.replan_step_count = 0
+        self.path_queue = []
+        self.current_waypoint_idx = 0
 
-    def _check_collision(self, node_arr, obstacles):
-        # 1. 地面与限高
-        if node_arr[2] > 0 or node_arr[2] < -250: return True
+        # 地图缓存
+        self.grid = None
+        self.min_bounds = None
+        self.grid_shape = None
+        self.initialized = False
 
-        # 2. 长方体检测 (Box Collision)
-        x, y, z = node_arr
+    def _init_grid(self, start_pos, target_pos, obstacles):
+        """动态构建 3D 占据栅格地图"""
+        # 1. 确定边界
+        all_x = [start_pos[0], target_pos[0]]
+        all_y = [start_pos[1], target_pos[1]]
+        # NED: 地面是0, 楼顶是 -h. 这是一个从负数到0的区间
+        all_z = [start_pos[2], target_pos[2], 0]
 
-        for obs in obstacles:
-            # obs: [cx, cy, w, l, h]
-            cx, cy, w, l, h = obs
+        for o in obstacles:
+            cx, cy, w, l, h = o
+            all_x.extend([cx - w / 2, cx + w / 2])
+            all_y.extend([cy - l / 2, cy + l / 2])
+            all_z.append(-h)
 
-            # 计算包含安全余量的边界
-            # 为什么是 w/2 + margin? 因为是从中心向两边扩
-            x_min = cx - (w / 2 + self.safety_margin)
-            x_max = cx + (w / 2 + self.safety_margin)
-            y_min = cy - (l / 2 + self.safety_margin)
-            y_max = cy + (l / 2 + self.safety_margin)
+        buffer = 60.0  # 边界余量
+        self.min_bounds = np.array([min(all_x) - buffer, min(all_y) - buffer, min(all_z) - buffer])
+        self.max_bounds = np.array([max(all_x) + buffer, max(all_y) + buffer, 10.0])  # 上限略高于地面
 
-            # 垂直边界: 建筑是从地面(0)长到(-h)
-            # 所以如果在 [x_min, x_max] 和 [y_min, y_max] 范围内，
-            # 且高度 > (-h - margin)，就算碰撞 (注意NED高度是负的，越高越小)
-            # z_top = -h
-            z_collision_threshold = -h - 5.0  # 顶部额外留 5米余量
+        self.grid_shape = np.ceil((self.max_bounds - self.min_bounds) / self.res).astype(int)
+        self.grid = np.zeros(self.grid_shape, dtype=np.uint8)
 
-            if (x_min <= x <= x_max) and (y_min <= y <= y_max):
-                # 水平位置冲突，检查高度
-                # 如果当前高度 Z > z_collision_threshold (意味着在楼下方)，则碰撞
-                if z > z_collision_threshold:
-                    return True
+        print(f"[A*] Initializing Grid: Shape={self.grid_shape}, Res={self.res}m")
 
-        return False
+        # 2. 障碍物栅格化
+        for o in obstacles:
+            cx, cy, w, l, h = o
+            # 障碍物 AABB (NED: z in [-h, 0])
+            ox_min = cx - w / 2 - self.margin
+            ox_max = cx + w / 2 + self.margin
+            oy_min = cy - l / 2 - self.margin
+            oy_max = cy + l / 2 + self.margin
+            oz_min = -h - self.margin  # 楼顶上方一点
+            oz_max = 0  # 地面
 
-    def _plan_path(self, start, goal, obstacles):
-        # 坐标离散化
-        start_node = tuple(np.round(start / self.grid_res) * self.grid_res)
-        goal_node = tuple(np.round(goal / self.grid_res) * self.grid_res)
+            idx_x_min, idx_x_max = self._pos_to_idx_range(ox_min, ox_max, 0)
+            idx_y_min, idx_y_max = self._pos_to_idx_range(oy_min, oy_max, 1)
+            idx_z_min, idx_z_max = self._pos_to_idx_range(oz_min, oz_max, 2)
+
+            self.grid[idx_x_min:idx_x_max, idx_y_min:idx_y_max, idx_z_min:idx_z_max] = 1
+
+        # 3. 地面栅格化 (z > 0)
+        # [FIX] 修复了这里的解包错误
+        g_z_min, g_z_max = self._pos_to_idx_range(0, 100, 2)
+
+        if g_z_min < self.grid_shape[2]:
+            self.grid[:, :, g_z_min:] = 1  # 地面以下全堵死
+
+        self.initialized = True
+
+    def _pos_to_idx(self, pos):
+        idx = np.floor((pos - self.min_bounds) / self.res).astype(int)
+        for i in range(3):
+            idx[i] = np.clip(idx[i], 0, self.grid_shape[i] - 1)
+        return tuple(idx)
+
+    def _idx_to_pos(self, idx):
+        return self.min_bounds + (np.array(idx) + 0.5) * self.res
+
+    def _pos_to_idx_range(self, v_min, v_max, dim):
+        i_min = int(np.floor((v_min - self.min_bounds[dim]) / self.res))
+        i_max = int(np.ceil((v_max - self.min_bounds[dim]) / self.res))
+        return max(0, i_min), min(self.grid_shape[dim], i_max)
+
+    def _astar_search(self, start_idx, target_idx):
+        if self.grid[start_idx] == 1:
+            # 起点在障碍物内，A* 无法开始
+            # 简单策略：向 z 轴负方向（向上）搜索最近的自由点
+            print("[A*] Start in obstacle. Searching for free space upwards...")
+            curr = list(start_idx)
+            found = False
+            for z in range(curr[2], -1, -1):
+                if self.grid[curr[0], curr[1], z] == 0:
+                    start_idx = (curr[0], curr[1], z)
+                    found = True
+                    break
+            if not found:
+                return None
 
         open_set = []
-        heapq.heappush(open_set, (0, start_node))
+        heapq.heappush(open_set, (0, start_idx))
         came_from = {}
-        g_score = {start_node: 0}
+        g_score = {start_idx: 0}
 
-        # 6邻域
-        step = self.grid_res
-        motions = [
-            np.array([step, 0, 0]), np.array([-step, 0, 0]),
-            np.array([0, step, 0]), np.array([0, -step, 0]),
-            np.array([0, 0, -step]), np.array([0, 0, step])
-        ]
+        # 3D 邻域 (26连通)
+        neighbors = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1) if
+                     not (dx == 0 and dy == 0 and dz == 0)]
 
-        max_ops = 5000
-        ops = 0
-        final_node = None
+        max_steps = 50000
+        steps = 0
 
-        while open_set and ops < max_ops:
-            ops += 1
-            current = heapq.heappop(open_set)[1]
-            curr_arr = np.array(current)
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            steps += 1
 
-            if np.linalg.norm(curr_arr - np.array(goal_node)) < self.grid_res * 1.5:
-                final_node = current
-                break
+            if current == target_idx:
+                path = []
+                while current in came_from:
+                    path.append(self._idx_to_pos(current))
+                    current = came_from[current]
+                path.reverse()
+                return path
 
-            for m in motions:
-                neighbor_arr = curr_arr + m
-                neighbor = tuple(neighbor_arr)
+            if steps > max_steps:
+                print("[A*] Search timeout.")
+                return None
 
-                # 范围限制 (Map bounds)
-                if abs(neighbor_arr[0] - start[0]) > 1200 or abs(neighbor_arr[1] - start[1]) > 1200:
+            for dx, dy, dz in neighbors:
+                nxt = (current[0] + dx, current[1] + dy, current[2] + dz)
+
+                # 越界检查
+                if not (0 <= nxt[0] < self.grid_shape[0] and
+                        0 <= nxt[1] < self.grid_shape[1] and
+                        0 <= nxt[2] < self.grid_shape[2]):
                     continue
 
-                # 碰撞检测
-                if self._check_collision(neighbor_arr, obstacles):
+                # 碰撞检查
+                if self.grid[nxt] == 1:
                     continue
 
-                new_g = g_score[current] + np.linalg.norm(m)
-                if neighbor not in g_score or new_g < g_score[neighbor]:
-                    g_score[neighbor] = new_g
-                    f = new_g + self._heuristic(neighbor_arr, goal_node)
-                    came_from[neighbor] = current
-                    heapq.heappush(open_set, (f, neighbor))
+                dist = math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+                new_g = g_score[current] + dist
 
-        if final_node:
-            path = []
-            curr = final_node
-            while curr in came_from:
-                path.append(np.array(curr))
-                curr = came_from[curr]
-            path.reverse()
-            path.append(goal)
-            self.waypoints = path
-            print(f"[A*] Path found with {len(path)} nodes.")
-        else:
-            print("[A*] Failed to find path. Climbing up.")
-            # 失败保护：向上飞
-            self.waypoints = [start + np.array([0, 0, -50]), goal]
-
-        self.current_wp_idx = 0
+                if nxt not in g_score or new_g < g_score[nxt]:
+                    g_score[nxt] = new_g
+                    # 启发式函数乘 1.001 打破对称性
+                    h_val = math.sqrt(sum((np.array(nxt) - np.array(target_idx)) ** 2))
+                    priority = new_g + h_val * 1.001
+                    came_from[nxt] = current
+                    heapq.heappush(open_set, (priority, nxt))
+        return None
 
     def compute_velocity_command(self, current_pos, current_vel, target_pos, obstacles, power_state, dt, **kwargs):
-        self.step_counter += 1
+        # 初始化
+        if not self.initialized:
+            self._init_grid(current_pos, target_pos, obstacles)
 
-        # 规划触发逻辑
-        if not self.waypoints or \
-                (self.step_counter % self.replan_interval == 0 and np.linalg.norm(current_pos - target_pos) > 20):
-            self._plan_path(current_pos, target_pos, obstacles)
+        # 靠近目标时直接飞
+        if np.linalg.norm(current_pos - target_pos) < 20.0:
+            return (target_pos - current_pos)
 
-        if not self.waypoints: return np.zeros(3)
+        # 重规划逻辑
+        need_replan = (not self.path_queue) or (self.replan_step_count >= self.replan_interval)
 
-        # 路径跟踪
-        target_wp = self.waypoints[self.current_wp_idx]
-        dist = np.linalg.norm(current_pos - target_wp)
+        if need_replan:
+            self.replan_step_count = 0
+            start_idx = self._pos_to_idx(current_pos)
+            target_idx = self._pos_to_idx(target_pos)
 
-        if dist < 15.0:
-            self.current_wp_idx = min(self.current_wp_idx + 1, len(self.waypoints) - 1)
-            target_wp = self.waypoints[self.current_wp_idx]
+            new_path = self._astar_search(start_idx, target_idx)
+            if new_path:
+                self.path_queue = new_path
+                self.current_waypoint_idx = 0
+                # print(f"[A*] Replan success. Path Len: {len(new_path)}")
+            else:
+                print("[A*] Replan failed. Climbing up.")
+                # 失败策略：如果高度不够高，先向上爬升 (NED 负方向)
+                if current_pos[2] > -150:
+                    return np.array([0, 0, -3.0])
+                # 否则直接朝目标冲（死马当活马医）
+                else:
+                    dir_vec = target_pos - current_pos
+                    return dir_vec / np.linalg.norm(dir_vec) * 5.0
 
-        direction = target_wp - current_pos
-        norm = np.linalg.norm(direction)
-        if norm > 0.1:
-            return (direction / norm) * 12.0
+        self.replan_step_count += 1
+
+        # 路径跟踪 (Pure Pursuit)
+        if self.path_queue:
+            # 寻找预瞄点 (Looking ahead)
+            lookahead_idx = min(self.current_waypoint_idx + 2, len(self.path_queue) - 1)
+            target_pt = self.path_queue[lookahead_idx]
+
+            # 检查是否通过了当前点
+            dist_to_curr = np.linalg.norm(current_pos - self.path_queue[self.current_waypoint_idx])
+            if dist_to_curr < 15.0:
+                self.current_waypoint_idx = min(self.current_waypoint_idx + 1, len(self.path_queue) - 1)
+
+            direction = target_pt - current_pos
+            if np.linalg.norm(direction) > 0.1:
+                return (direction / np.linalg.norm(direction)) * 15.0
+
         return np.zeros(3)
 
 
 class SACPlanner(BasePlanner):
     """
-    修正点：使用 ActorSAC 类加载模型，并调用正确的推理接口
+    SAC 深度强化学习规划器
     """
 
     def __init__(self, model_path: str, device: str = 'cpu'):
+        if ActorSAC is None:
+            raise ImportError("Cannot use SACPlanner because rl_core.py is missing.")
+
         self.device = torch.device(device)
         self.max_speed = 15.0
         self.state_dim = 11
         self.action_dim = 3
 
-        # [FIX] 使用 ActorSAC 而不是 Actor
-        # 注意：ActorSAC 的构造函数参数可能需要根据 rl_core.py 调整，这里假设使用默认 hidden_dim
+        # 初始化网络
         self.actor = ActorSAC(self.state_dim, self.action_dim, max_action=1.0).to(self.device)
 
         try:
-            # 加载模型
             self.actor.load_state_dict(torch.load(model_path, map_location=self.device))
             self.actor.eval()
             print(f"[SACPlanner] Model loaded from {model_path}")
         except Exception as e:
-            print(f"[SACPlanner] Warning: Failed to load model from {model_path}. Error: {e}")
-            # 初始化一个随机网络以防崩溃
+            print(f"[SACPlanner] Error loading model: {e}")
+            print("[SACPlanner] Running with UNTRAINED random weights!")
 
     def compute_velocity_command(self, current_pos, current_vel, target_pos, obstacles,
                                  power_state, dt, future_trajectory=None):
+
+        # 构建观测向量 (需要与训练时的 Env._get_obs 保持一致)
+        # 假设训练环境也做了类似的归一化
         to_target = target_pos - current_pos
-        # 归一化处理应与 training 保持一致
+
         obs = np.concatenate([
-            current_pos / 800.0,  # 简单归一化位置
-            current_vel / 15.0,  # 归一化速度
-            to_target / 800.0,
+            current_pos / 1000.0,  # 位置归一化
+            current_vel / 15.0,  # 速度归一化
+            to_target / 1000.0,  # 相对距离归一化
             [power_state.get('soc', 0.6)],
             [power_state.get('h2_cum', 0) / 100.0]
         ]).astype(np.float32)
 
-        # 确保维度匹配
+        # 维度对齐
         if len(obs) != self.state_dim:
-            # 如果维度不对，补零或截断（防止crash）
             obs = np.resize(obs, self.state_dim)
 
         state_t = torch.FloatTensor(obs.reshape(1, -1)).to(self.device)
 
         with torch.no_grad():
-            # [FIX] 使用 get_action 接口，且 deterministic=True (推理模式)
+            # 推理模式 deterministic=True
             action = self.actor.get_action(state_t, deterministic=True).cpu().data.numpy().flatten()
 
         return action * self.max_speed

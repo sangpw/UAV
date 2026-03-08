@@ -1,89 +1,108 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from typing import Tuple
 
 
 # ==========================================
-# 1. 修正后的无人机物理模型 (包含在此脚本中以便独立运行)
+# 1. 多旋翼无人机物理模型类
 # ==========================================
-class MultirotorUAV_Fixed:
-    def __init__(self, mass=5.0, rotor_radius=0.15, num_rotors=4):
+class MultirotorUAV:
+    """
+    多旋翼无人机飞行动力学模型 (优化版)
+    """
+
+    def __init__(self, mass=5.0, rotor_radius=0.15, num_rotors=4, max_speed=20.0):
         self.m = mass
         self.R = rotor_radius
         self.n_rotors = num_rotors
+        self.max_speed = max_speed
         self.rho = 1.225
 
         # 状态: [x, y, z, vx, vy, vz] (NED坐标系: z向下为正)
         self.state = np.zeros(6)
         self.A_rotor = np.pi * rotor_radius ** 2
 
-        # 理论悬停功率计算 (动量理论)
-        self.thrust_hover = self.m * 9.81
-        self.hover_power_theoretical = (self.thrust_hover ** 1.5) / \
+        # 功率计算基准 (悬停功率)
+        # 理论悬停推力 = mg
+        thrust_hover = self.m * 9.81
+        # 理论悬停诱导功率
+        self.hover_power_theoretical = (thrust_hover ** 1.5) / \
                                        np.sqrt(2 * self.n_rotors * self.rho * self.A_rotor)
 
-        # 考虑电机效率
+        # 考虑到电机效率及其他损耗的实际悬停功率估算 (仅用于参考/打印)
         self.hover_power_elec = self.hover_power_theoretical / 0.85
 
-    def reset(self):
+    def reset(self, position: np.ndarray):
+        """重置状态"""
         self.state = np.zeros(6)
-        # 初始高度设为 -10m (空中)
-        self.state[2] = -10.0
+        self.state[:3] = position
+        return self.state.copy()
 
     def compute_power(self, velocity: np.ndarray, acceleration: np.ndarray) -> float:
+        """计算当前飞行状态所需功率 (W)"""
         v = np.linalg.norm(velocity)
 
-        # 1. 诱导功率 (Induced Power) - 随前飞速度增加而降低
-        v_tip = 150.0
+        # 1. 诱导功率 (Induced Power) - 平滑过渡修正
+        v_tip = 150.0  # 桨尖速度 (典型值)
         mu = v / v_tip
-        # 简单的诱导功率修正系数
-        if mu < 0.1:
-            k_ind = 1.0
-        else:
-            k_ind = 1.15  # 高速下湍流增加
+
+        # 平滑过渡系数：从悬停(1.0)平滑过渡到高速前飞(1.15)
+        # 模拟前飞时的湍流增加
+        k_ind = 1.0 + 0.15 * np.clip(mu / 0.1, 0.0, 1.0)
 
         # 核心公式：随速度增加，诱导功率下降 (Translational Lift)
-        # max(0.2, ...) 防止功率降得太低
-        P_ind = self.hover_power_theoretical * k_ind * max(0.2, 1.0 - (mu * 15))
-        # 注意：原代码的公式比较简单，这里为了验证物理特性，使用原代码逻辑，
-        # 但原代码: max(0.5, 1.0 - 0.5 * mu ** 2) 下降得不够快，我们保持原逻辑进行验证。
-        P_ind = self.hover_power_theoretical * k_ind * max(0.5, 1.0 - 0.5 * mu ** 2)
+        # max(0.4, ...) 限制诱导功率最低降至悬停的40%，防止数值过低
+        P_ind = self.hover_power_theoretical * k_ind * max(0.4, 1.0 - 0.5 * mu ** 2)
 
         # 2. 型阻功率 (Profile Drag) - 随速度立方增加
-        # 假设 Cd_mean = 0.05 (桨叶阻力系数)
-        # P = 1/8 * rho * N * A * Cd * v_tip^3 ... 简化为:
-        P_prof = 0.1 * self.rho * self.n_rotors * self.A_rotor * (v ** 3)
-        # 原代码系数修正：
+        # 模拟空气阻力对旋翼旋转的阻碍
         P_prof = 0.1 * self.rho * self.n_rotors * self.A_rotor * (v ** 3)
 
-        # 3. 爬升/重力功率 [已修正逻辑]
+        # 3. 爬升/重力功率 (Gravity / Climb Power)
         # NED坐标系: z轴向下。velocity[2] < 0 代表向上爬升。
-        v_vertical = velocity[2]
+        # 只有向上爬升时，重力才做负功(消耗能量)。下降时电机通常不回收能量，视为0或维持怠速。
+        v_climb = -velocity[2]  # 向上速度
         P_climb = 0
-        if v_vertical < 0:  # 向上飞
-            # P = F * v
-            P_climb = self.m * 9.81 * abs(v_vertical)
+        if v_climb > 0:
+            P_climb = self.m * 9.81 * v_climb
 
-        # 4. 机动/加速度功率
+        # 4. 机动/加速度功率 (Inertial Power)
+        # F = ma, P = F*v
         P_accel = self.m * np.linalg.norm(acceleration) * v * 0.5
 
-        # 总功率 / 效率 + 待机功耗
+        # 总功率 / 综合效率 (0.85) + 基础待机功耗 (50W)
         total = (P_ind + P_prof + P_climb + P_accel) / 0.85
         return max(total, 50.0)
 
-    def step(self, target_vel, dt):
-        # 动力学滞后模拟 (tau = 0.3s)
-        curr_v = self.state[3:]
+    def step(self, target_velocity: np.ndarray, dt: float) -> Tuple[np.ndarray, float]:
+        """
+        执行一步仿真
+        :param target_velocity: 目标速度 [vx, vy, vz]
+        :param dt: 时间步长
+        :return: (新状态, 瞬时功率)
+        """
+        # 动力学滞后模拟 (一阶低通滤波, tau = 0.3s)
         tau = 0.3
+        current_v = self.state[3:]
 
-        # 一阶低通滤波
-        new_v = curr_v + (target_vel - curr_v) * (dt / tau)
+        # 计算新速度
+        new_v = current_v + (target_velocity - current_v) * (dt / tau)
 
-        acc = (new_v - curr_v) / dt
-        self.state[3:] = new_v
+        # 速度截断 (安全限制)
+        new_v = np.clip(new_v, -self.max_speed, self.max_speed)
+
+        # 计算加速度 (用于功率计算)
+        acc = (new_v - current_v) / dt
+
+        # 更新位置 (欧拉积分)
         self.state[:3] += new_v * dt
+        # 更新速度
+        self.state[3:] = new_v
 
+        # 计算功率
         power = self.compute_power(new_v, acc)
-        return self.state, power
+
+        return self.state.copy(), power
 
 
 # ==========================================
@@ -91,12 +110,12 @@ class MultirotorUAV_Fixed:
 # ==========================================
 
 def validate_physics():
-    uav = MultirotorUAV_Fixed()
+    uav = MultirotorUAV()
     dt = 0.1
     print(f"=== 无人机参数 ===")
     print(f"质量: {uav.m} kg")
     print(f"理论悬停机械功率: {uav.hover_power_theoretical:.2f} W")
-    print(f"预估悬停电功率 (eff=0.85): {uav.hover_power_elec + 50:.2f} W (含待机)")
+    print(f"预估悬停电功率 (eff=0.85): {uav.hover_power_elec:.2f} W")
     print("=" * 30)
 
     # --- 测试 1: 速度-功率曲线 (水平飞行) ---
@@ -105,12 +124,15 @@ def validate_physics():
     powers = []
 
     for v_x in speeds:
-        uav.reset()
-        # 让无人机稳定在这个速度
-        target = np.array([v_x, 0, 0])
-        # 预热 2秒让速度稳定
-        for _ in range(20): uav.step(target, dt)
+        # 重置位置，高度设为-10m
+        uav.reset(np.array([0, 0, -10.0]))
 
+        target = np.array([v_x, 0, 0])
+        # 预热 3秒 (30 steps) 让速度稳定，消除加速度功率的影响
+        for _ in range(30):
+            uav.step(target, dt)
+
+        # 记录稳定飞行时的功率
         _, p = uav.step(target, dt)
         powers.append(p)
 
@@ -119,7 +141,8 @@ def validate_physics():
     t_vertical = []
     v_z_act = []
     p_vertical = []
-    uav.reset()
+
+    uav.reset(np.array([0, 0, -10.0]))
 
     steps = 300  # 30秒
     for i in range(steps):
@@ -128,15 +151,12 @@ def validate_physics():
         # 0-10s: 悬停
         if t < 10:
             cmd = np.array([0, 0, 0])
-            status = "Hover"
         # 10-20s: 爬升 3m/s (NED: -3)
         elif t < 20:
             cmd = np.array([0, 0, -3])
-            status = "Climb"
         # 20-30s: 下降 3m/s (NED: +3)
         else:
             cmd = np.array([0, 0, 3])
-            status = "Descent"
 
         state, p = uav.step(cmd, dt)
 
@@ -148,14 +168,16 @@ def validate_physics():
     print("[Test 3] 速度阶跃响应测试...")
     t_step = []
     v_x_act = []
-    uav.reset()
+
+    uav.reset(np.array([0, 0, -10.0]))
+
     for i in range(100):  # 10秒
         t = i * dt
         # 1秒时给出 10m/s 指令
         cmd = np.array([10, 0, 0]) if t > 1.0 else np.array([0, 0, 0])
         state, _ = uav.step(cmd, dt)
         t_step.append(t)
-        v_x_act.append(state[3])
+        v_x_act.append(state[3])  # vx
 
     # ==========================================
     # 3. 绘图验证
@@ -165,21 +187,25 @@ def validate_physics():
     # 图1: P-V 曲线
     ax1 = axes[0, 0]
     ax1.plot(speeds, powers, 'b-', linewidth=2)
-    ax1.set_title("Test 1: Power vs Horizontal Speed")
+    ax1.set_title("Test 1: Power vs Horizontal Speed (Bucket Curve)")
     ax1.set_xlabel("Speed (m/s)")
     ax1.set_ylabel("Power (W)")
     ax1.grid(True)
-    # 理论分析标记
+
+    # 寻找最佳巡航速度（功率最低点）
     min_idx = np.argmin(powers)
-    ax1.plot(speeds[min_idx], powers[min_idx], 'ro', label=f'Max Range Speed (~{speeds[min_idx]:.1f}m/s)')
+    min_power = powers[min_idx]
+    best_speed = speeds[min_idx]
+    ax1.plot(best_speed, min_power, 'ro', label=f'Best Endurance: {best_speed:.1f}m/s')
+
+    ax1.text(0.5, powers[0], "Hover", color='blue', fontweight='bold')
     ax1.legend()
-    ax1.text(0, powers[0] + 20, "Hover", color='blue')
-    ax1.text(15, powers[-1] - 100, "Drag Dominates", color='blue')
 
     # 图2: 垂直速度跟踪
     ax2 = axes[0, 1]
     ax2.plot(t_vertical, v_z_act, 'k-', label='Actual Vz')
-    ax2.plot(t_vertical, [0] * 100 + [-3] * 100 + [3] * 100, 'r--', alpha=0.5, label='Command')
+    # 绘制参考线
+    ax2.plot([0, 10, 10, 20, 20, 30], [0, 0, -3, -3, 3, 3], 'r--', alpha=0.5, label='Command')
     ax2.set_title("Test 2: Vertical Velocity (NED Frame)")
     ax2.set_ylabel("Vz (m/s) [Neg=Up, Pos=Down]")
     ax2.grid(True)
@@ -193,14 +219,15 @@ def validate_physics():
     ax3.set_ylabel("Power (W)")
     ax3.grid(True)
     # 标注区域
-    ax3.axvspan(10, 20, color='red', alpha=0.1, label='Climb')
-    ax3.axvspan(20, 30, color='green', alpha=0.1, label='Descent')
+    ax3.axvspan(10, 20, color='red', alpha=0.1, label='Climb Phase')
+    ax3.axvspan(20, 30, color='green', alpha=0.1, label='Descent Phase')
     ax3.legend()
 
     # 验证逻辑：爬升功率应显著大于下降功率
-    avg_hover = np.mean(p_vertical[50:90])
-    avg_climb = np.mean(p_vertical[150:190])
-    avg_descent = np.mean(p_vertical[250:290])
+    # 索引转换: dt=0.1, 10s=100 steps
+    avg_hover = np.mean(p_vertical[50:90])  # 5-9s
+    avg_climb = np.mean(p_vertical[150:190])  # 15-19s
+    avg_descent = np.mean(p_vertical[250:290])  # 25-29s
 
     print(f"\n[验证结果]")
     print(f"悬停平均功率: {avg_hover:.1f} W")
@@ -208,18 +235,24 @@ def validate_physics():
     print(f"下降平均功率: {avg_descent:.1f} W (预期: ≈ 悬停或略低)")
 
     if avg_climb > avg_hover + 100:
-        print(">> ✅ 爬升物理模型正常 (重力做功被计入)")
+        print(">> ✅ 爬升物理模型正常 (克服重力做功)")
     else:
         print(">> ❌ 爬升模型异常 (功率未显著增加)")
+
+    if avg_descent < avg_climb:
+        print(">> ✅ 下降物理模型正常 (重力辅助)")
 
     # 图4: 阶跃响应
     ax4 = axes[1, 1]
     ax4.plot(t_step, v_x_act, 'b-', label='Response')
-    ax4.axvline(1.0, color='k', linestyle=':', label='Step Input')
-    ax4.axvline(1.0 + 0.3, color='r', linestyle='--', label='Tau (0.3s)')
-    ax4.axhline(10 * 0.632, color='r', linestyle=':', alpha=0.5, label='63.2% Target')
+    ax4.axvline(1.0, color='k', linestyle=':', label='Step Input (10m/s)')
+    # 计算63.2%响应时间点 (Tau)
+    target_val = 10.0
+    tau_val = target_val * 0.632
+    ax4.axhline(tau_val, color='r', linestyle=':', alpha=0.5, label='63.2% Target')
     ax4.set_title("Test 3: Step Response (Inertia Check)")
     ax4.set_xlabel("Time (s)")
+    ax4.set_ylabel("Vx (m/s)")
     ax4.legend()
     ax4.grid(True)
 
