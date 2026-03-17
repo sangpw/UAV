@@ -4,6 +4,9 @@ from gymnasium import spaces
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 
+# 导入utils中的地图生成工具
+from utils import generate_city_blocks, set_fixed_map_flag
+
 # 尝试导入物理模型 (保持你的原始逻辑)
 try:
     from models import MultirotorUAV, LithiumBattery, FuelCellStack
@@ -57,6 +60,9 @@ class UrbanPlanningEnv(gym.Env):
         self.map_seed = map_seed
         self.obstacles = []
 
+        # 设置全局固定地图开关
+        set_fixed_map_flag(fixed_map)
+
         # 物理模型
         self.uav = MultirotorUAV()
         self.bat = LithiumBattery()
@@ -71,99 +77,13 @@ class UrbanPlanningEnv(gym.Env):
 
         # 如果是固定地图，初始化时生成
         if self.fixed_map:
-            rng = np.random.default_rng(self.map_seed)
-            self.obstacles = self._generate_city_blocks(self.num_obstacles, rng)
-
-    def _generate_city_blocks(self, n, rng):
-        """
-        生成互不重叠的城市建筑 (Rejection Sampling)
-        """
-        obs = []
-
-        # 定义地图生成范围 (在起点终点周围扩展)
-        margin = 100
-        min_x = min(self.start_pos[0], self.target_pos[0]) - margin
-        max_x = max(self.start_pos[0], self.target_pos[0]) + margin
-        min_y = min(self.start_pos[1], self.target_pos[1]) - margin
-        max_y = max(self.start_pos[1], self.target_pos[1]) + margin
-
-        # 最大尝试次数，防止死循环
-        max_attempts = n * 50
-        attempts = 0
-
-        while len(obs) < n and attempts < max_attempts:
-            attempts += 1
-
-            # 1. 随机生成尺寸 (更加多样化)
-            # 区分高瘦楼(写字楼)和矮胖楼(商场)
-            if rng.random() < 0.3:
-                # 高楼
-                width = rng.uniform(30, 60)
-                length = rng.uniform(30, 60)
-                height = rng.uniform(100, 250)
-            else:
-                # 普通建筑
-                width = rng.uniform(50, 120)
-                length = rng.uniform(50, 120)
-                height = rng.uniform(40, 120)
-
-            # 2. 随机位置
-            cx = rng.uniform(min_x, max_x)
-            cy = rng.uniform(min_y, max_y)
-
-            new_block = np.array([cx, cy, width, length, height])
-
-            # 3. 冲突检测
-            if not self._is_valid_placement(new_block, obs):
-                continue
-
-            obs.append(new_block)
-
-        if len(obs) < n:
-            print(f"Warning: Only placed {len(obs)}/{n} obstacles due to space constraints.")
-
-        return obs
-
-    def _is_valid_placement(self, new_block, existing_blocks):
-        """检测新生成的方块是否有效"""
-        cx, cy, w, l, _ = new_block
-
-        # --- A. 保护区检测 (Start/Target Safety Zone) ---
-        # 保护半径
-        safe_radius = 60.0
-
-        # 计算新楼房的矩形边界 (AABB)
-        min_bx, max_bx = cx - w / 2, cx + w / 2
-        min_by, max_by = cy - l / 2, cy + l / 2
-
-        # 检查是否覆盖 Start 点
-        if (min_bx - safe_radius < self.start_pos[0] < max_bx + safe_radius) and \
-                (min_by - safe_radius < self.start_pos[1] < max_by + safe_radius):
-            return False
-
-        # 检查是否覆盖 Target 点
-        if (min_bx - safe_radius < self.target_pos[0] < max_bx + safe_radius) and \
-                (min_by - safe_radius < self.target_pos[1] < max_by + safe_radius):
-            return False
-
-        # --- B. 建筑物间距检测 (Overlap Check) ---
-        for ex_block in existing_blocks:
-            ex_cx, ex_cy, ex_w, ex_l, _ = ex_block
-
-            # 两个矩形是否重叠逻辑:
-            # 如果 (RectA.left < RectB.right) && (RectA.right > RectB.left) ...
-            # 我们加上 min_building_dist 作为缓冲区
-            buffer = self.min_building_dist
-
-            # 检查 X 轴投影是否重叠 (带缓冲)
-            overlap_x = (abs(cx - ex_cx) * 2) < (w + ex_w + buffer * 2)
-            # 检查 Y 轴投影是否重叠 (带缓冲)
-            overlap_y = (abs(cy - ex_cy) * 2) < (l + ex_l + buffer * 2)
-
-            if overlap_x and overlap_y:
-                return False  # 发生重叠或间距过小
-
-        return True
+            self.obstacles = generate_city_blocks(
+                n=self.num_obstacles,
+                start_pos=self.start_pos,
+                target_pos=self.target_pos,
+                min_building_dist=self.min_building_dist,
+                seed=self.map_seed
+            )
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -171,7 +91,13 @@ class UrbanPlanningEnv(gym.Env):
         # 如果不是固定地图，每次重新生成
         if not self.fixed_map:
             # 使用 seed 初始化的随机生成器
-            self.obstacles = self._generate_city_blocks(self.num_obstacles, self.np_random)
+            self.obstacles = generate_city_blocks(
+                n=self.num_obstacles,
+                start_pos=self.start_pos,
+                target_pos=self.target_pos,
+                min_building_dist=self.min_building_dist,
+                seed=seed
+            )
 
         self.uav.reset(self.start_pos)
         self.bat = LithiumBattery()
@@ -211,7 +137,7 @@ class UrbanPlanningEnv(gym.Env):
 
         # 地面检测
         if pos[2] > 0:
-            terminated = True;
+            terminated = True
             reward = -1000
 
         # 建筑物检测
@@ -282,34 +208,11 @@ class UrbanPlanningEnv(gym.Env):
 
         ax.set_xlim(mid_x - max_range, mid_x + max_range)
         ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        ax.set_zlim(-300, 10)  # 假设最高楼不超过300米
+        ax.set_zlim(-300, 50)  # 固定Z轴范围，适配建筑高度
 
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m) NED')
-
-        # 反转Z轴，符合NED坐标系直觉（天空在上方）
-        ax.invert_zaxis()
-
-        ax.set_title(f"Urban Mission (Obstacles: {len(self.obstacles)})")
-        plt.legend(loc='upper right')
-        plt.draw()
-        plt.pause(0.001)  # 给绘图窗口刷新时间
-
-
-# ==========================================
-# 验证与测试
-# ==========================================
-if __name__ == "__main__":
-    # 测试随机地图的生成质量
-    print("生成随机城区地图...")
-    env = UrbanPlanningEnv(num_obstacles=30, fixed_map=False, min_building_dist=30)
-
-    # 重置并渲染
-    env.reset(seed=2024)
-    env.render()
-
-    # 再次重置看是否变化
-    print("生成另一个随机地图...")
-    env.reset(seed=999)
-    env.render()
+        ax.set_zlabel('Z (m)')
+        ax.set_title('Urban UAV Planning Env')
+        ax.legend()
+        plt.show()

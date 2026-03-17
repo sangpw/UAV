@@ -106,7 +106,7 @@ class NormalizedEnvWrapper(gym.Wrapper):
 # ==========================================
 def train():
     # 配置参数
-    MAX_EPISODES = 200
+    MAX_EPISODES = 2000
     MAX_STEPS = 400
     BATCH_SIZE = 256
     START_STEPS = 2000  # 预热步数 (保持 2000 即可)

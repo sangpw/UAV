@@ -7,6 +7,8 @@ from gymnasium import spaces
 from typing import Dict, Tuple, Optional, List
 from models import MultirotorUAV, FuelCellStack, LithiumBattery
 
+# 新增：导入utils中的地图生成工具
+from utils import generate_city_blocks, set_fixed_map_flag
 
 class HierarchicalUAVEnv:
     """
@@ -18,7 +20,12 @@ class HierarchicalUAVEnv:
                  ems_dt: float = 0.1,
                  T_sim: float = 600.0,
                  start_pos: np.ndarray = np.array([0., 0., -10.]),
-                 target_pos: np.ndarray = np.array([800., 600., -100.])):
+                 target_pos: np.ndarray = np.array([800., 600., -100.]),
+                 # 新增参数：地图生成相关
+                 num_obstacles: int = 15,          # 障碍物数量
+                 fixed_map: bool = False,          # 是否使用固定地图
+                 map_seed: int = 42,               # 固定地图种子
+                 min_building_dist: float = 30.0): # 楼宇最小间距
 
         self.planner_dt = planner_dt
         self.ems_dt = ems_dt
@@ -33,11 +40,26 @@ class HierarchicalUAVEnv:
         self.start_pos = start_pos
         self.target_pos = target_pos
 
-        # 确保障碍物不会与起点重叠
-        self.obstacles = [
-            np.array([300.0, 300.0, 60.0, 60.0, 100.0]),
-            np.array([600.0, 700.0, 80.0, 80.0, 150.0]),
-        ]
+        # 新增：地图生成相关参数
+        self.num_obstacles = num_obstacles
+        self.fixed_map = fixed_map
+        self.map_seed = map_seed
+        self.min_building_dist = min_building_dist
+
+        # 全局固定地图开关
+        set_fixed_map_flag(fixed_map)
+
+        # 初始化障碍物（替换原硬编码列表）
+        self.obstacles = []
+        if self.fixed_map:
+            # 固定地图：初始化时生成一次
+            self.obstacles = generate_city_blocks(
+                n=self.num_obstacles,
+                start_pos=self.start_pos,
+                target_pos=self.target_pos,
+                min_building_dist=self.min_building_dist,
+                seed=self.map_seed
+            )
 
         self.planner = None
         self.ems = None
@@ -52,13 +74,23 @@ class HierarchicalUAVEnv:
     def set_ems(self, ems):
         self.ems = ems
 
-    def reset(self):
-        """重置环境并返回初始观测"""
+    def reset(self, seed: Optional[int] = None):
+        """重置环境并返回初始观测（新增seed参数支持）"""
         self.uav.reset(self.start_pos)
         self.fc = FuelCellStack(num_cells=50, cell_area=100, max_slew_rate=20.0)
         self.bat = LithiumBattery(capacity_ah=10, initial_soc=0.6)
         self.time_step = 0
         self.current_planned_vel = np.zeros(3)
+
+        # 非固定地图：每次reset重新生成障碍物
+        if not self.fixed_map:
+            self.obstacles = generate_city_blocks(
+                n=self.num_obstacles,
+                start_pos=self.start_pos,
+                target_pos=self.target_pos,
+                min_building_dist=self.min_building_dist,
+                seed=seed  # 使用传入的seed保证可复现
+            )
 
         # 检查初始状态是否合法（调试用）
         init_pos = self.uav.get_position()
@@ -94,12 +126,12 @@ class HierarchicalUAVEnv:
         ], dtype=np.float32)
 
     def _check_collision(self, pos):
-        """碰撞检测"""
+        """碰撞检测（保持原有逻辑，适配新的障碍物格式）"""
         # 地面碰撞 (z > 0 表示在地面上方，但起飞高度z<0，所以z>0是坠地)
         if pos[2] > 0:
             return True
 
-        # 障碍物碰撞 (适配 [cx, cy, w, l, h] 长方体格式)
+        # 障碍物碰撞 (适配 [cx, cy, w, l, h] 长方体格式，与utils生成的格式一致)
         for obs in self.obstacles:
             cx, cy, w, l, h = obs
             # NED坐标系: z越小越高, 高度低于楼顶即 pos[2] > -h
