@@ -7,7 +7,7 @@ import json
 import matplotlib.pyplot as plt
 
 from rl_core import TD3, ReplayBuffer
-from env_wrapper import UAVEnv
+from envs.env_wrapper import UAVEnv
 
 
 # ==========================================

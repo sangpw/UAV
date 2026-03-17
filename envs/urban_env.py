@@ -40,7 +40,7 @@ class UrbanPlanningEnv(gym.Env):
     def __init__(self,
                  start_pos=[0, 0, -10],
                  target_pos=[800, 600, -50],
-                 dt=0.5,
+                 dt=1,
                  num_obstacles=20,  # 稍微增加数量，测试密集城区
                  fixed_map: bool = False,
                  map_seed: int = 42,
