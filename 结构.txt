@@ -1,9 +1,24 @@
-ems.py中放能量管理算法，当前主要有：基于规则的，ECMS，MPC，TD3
-env_wrapper.py中放环境封装，将物理环境封装为Gym-Like 环境
-models.py中放物理模型，当前主要有：燃料电池物理模型与寿命模型，锂电池物理模型与SOH模型，多旋翼无人机飞行动力学模型
-planner.py中放任务规划模型，当前主要有：规则-based， A* 全局路径规划，SAC 强化学习路径规划
-rl_core.py中放强化学习框架，当前有TD3算法实现
-train_td3.py中放TD3训练代码，当前是根据随机生成的工况（需求功率曲线）进行训练
-train_SAC.py中放TD3训练代码，当前是根据随机生成的工况（需求功率曲线）进行训练
-utils.py中放工具函数，当前主要有随机功率曲线生成函数
-models文件夹中放神经网络模型
+UAVems/
+│
+├── models.py                #[对应 input_file_2] 底层物理模型 (多旋翼动力学、燃料电池、锂电池)
+├── rl_core.py               # [对应 input_file_4] 核心RL算法库 (TD3, SAC, ReplayBuffer, 神经网络定义)
+│
+├── envs/                    # 环境层
+│   ├── env_wrapper.py       #[对应 input_file_1] EMS能量管理训练环境 (固定工况)
+│   └── urban_env.py         # [对应 input_file_7] 城区路径规划训练环境 (3D避障)
+│
+├── controllers/             # 策略控制器层
+│   ├── ems_strategies.py    #[对应 input_file_0] 下层能量管理基线 (Rule-based, ECMS, MPC, TD3推理)
+│   └── planners.py          # [对应 input_file_3] 上层路径规划基线 (Rule-based, A*, SAC推理)
+│
+│
+├── test/             # 测试
+│   ├── test_planning.py
+│   └── test_UAV.py      
+│
+├── train_sac.py             # [对应 input_file_5] 训练上层路径规划器 (SAC)
+├── train_td3.py             # [对应 input_file_6] 训练下层能量管理器 (TD3)
+│
+└── models/                  # (自动生成) 用于存放训练好的 .pth 权重文件
+    ├── SAC/
+    └── TD3/
