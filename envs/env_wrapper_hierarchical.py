@@ -1,18 +1,21 @@
 # env_wrapper_hierarchical.py
 from math import inf
-
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Dict, Tuple, Optional, List
-from models import MultirotorUAV, FuelCellStack, LithiumBattery
 
-# 新增：导入utils中的地图生成工具
-from utils import generate_city_blocks, set_fixed_map_flag
+# 导入物理模型
+from models import MultirotorUAV, FuelCellStack, LithiumBattery
+# 导入工具函数
+from utils import generate_city_blocks, set_fixed_map_flag, check_collision
+# 核心修改：导入统一的观测构造器
+from rl_core import ObservationBuilder
+
 
 class HierarchicalUAVEnv:
     """
-    双层优化环境封装
+    双层优化环境封装 (支持跨层观测与标准重构)
     """
 
     def __init__(self,
@@ -21,18 +24,20 @@ class HierarchicalUAVEnv:
                  T_sim: float = 600.0,
                  start_pos: np.ndarray = np.array([0., 0., -10.]),
                  target_pos: np.ndarray = np.array([800., 600., -100.]),
-                 # 新增参数：地图生成相关
-                 num_obstacles: int = 15,          # 障碍物数量
-                 fixed_map: bool = False,          # 是否使用固定地图
-                 map_seed: int = 42,               # 固定地图种子
-                 min_building_dist: float = 30.0): # 楼宇最小间距
+                 num_obstacles: int = 15,
+                 fixed_map: bool = True,
+                 map_seed: int = 0,
+                 min_building_dist: float = 30.0):
 
         self.planner_dt = planner_dt
         self.ems_dt = ems_dt
         self.T_sim = T_sim
         self.substeps = int(planner_dt / ems_dt)
 
-        # 物理模型
+        # 1. 初始化统一观测构造器
+        self.obs_builder = ObservationBuilder()
+
+        # 2. 物理模型
         self.uav = MultirotorUAV(mass=5.0, rotor_radius=0.15, num_rotors=4)
         self.fc = FuelCellStack(num_cells=50, cell_area=100, max_slew_rate=20.0)
         self.bat = LithiumBattery(capacity_ah=10, initial_soc=0.6)
@@ -40,19 +45,15 @@ class HierarchicalUAVEnv:
         self.start_pos = start_pos
         self.target_pos = target_pos
 
-        # 新增：地图生成相关参数
+        # 3. 地图配置
         self.num_obstacles = num_obstacles
         self.fixed_map = fixed_map
         self.map_seed = map_seed
         self.min_building_dist = min_building_dist
-
-        # 全局固定地图开关
         set_fixed_map_flag(fixed_map)
 
-        # 初始化障碍物（替换原硬编码列表）
         self.obstacles = []
         if self.fixed_map:
-            # 固定地图：初始化时生成一次
             self.obstacles = generate_city_blocks(
                 n=self.num_obstacles,
                 start_pos=self.start_pos,
@@ -64,7 +65,9 @@ class HierarchicalUAVEnv:
         self.planner = None
         self.ems = None
 
+        # 4. 状态变量
         self.current_planned_vel = np.zeros(3)
+        self.last_p_load = 500.0  # 初始功耗（假设为悬停功耗）
         self.time_step = 0
         self.max_steps = int(T_sim / planner_dt)
 
@@ -75,49 +78,48 @@ class HierarchicalUAVEnv:
         self.ems = ems
 
     def reset(self, seed: Optional[int] = None):
-        """重置环境并返回初始观测（新增seed参数支持）"""
+        """重置环境并返回初始 12 维观测"""
         self.uav.reset(self.start_pos)
         self.fc = FuelCellStack(num_cells=50, cell_area=100, max_slew_rate=20.0)
         self.bat = LithiumBattery(capacity_ah=10, initial_soc=0.6)
+
         self.time_step = 0
         self.current_planned_vel = np.zeros(3)
+        self.last_p_load = 500.0  # 重置功耗记录
 
-        # 非固定地图：每次reset重新生成障碍物
         if not self.fixed_map:
             self.obstacles = generate_city_blocks(
                 n=self.num_obstacles,
                 start_pos=self.start_pos,
                 target_pos=self.target_pos,
                 min_building_dist=self.min_building_dist,
-                seed=seed  # 使用传入的seed保证可复现
+                seed=seed
             )
 
-        # 检查初始状态是否合法（调试用）
         init_pos = self.uav.get_position()
         dist_to_target = np.linalg.norm(init_pos - self.target_pos)
-        print(f"  [Reset] Start pos: {init_pos}, Target: {self.target_pos}, Dist: {dist_to_target:.1f}m")
+        print(f"  [Reset] Start: {init_pos}, Target: {self.target_pos}, Dist: {dist_to_target:.1f}m")
 
-        # 检查是否在障碍物内
-        if self._check_collision(init_pos):
+        if check_collision(init_pos, self.obstacles):
             print(f"  [Warning] Initial position collision detected!")
 
         return self._get_planner_obs()
 
     def _get_planner_obs(self):
-        """构建上层观测"""
-        pos = self.uav.get_position()
-        vel = self.uav.get_velocity()
-        to_target = self.target_pos - pos
-
-        obs = np.array([
-            *pos, *vel, *to_target,
-            self.bat.SOC,
-            self.fc.operating_hours * 10  # 累计氢耗近似
-        ], dtype=np.float32)
-        return obs
+        """
+        使用 rl_core.ObservationBuilder 构建标准 12 维观测
+        """
+        return self.obs_builder.build(
+            pos=self.uav.get_position(),
+            vel=self.uav.get_velocity(),
+            target=self.target_pos,
+            soc=self.bat.SOC,
+            p_load=self.last_p_load,  # 传入功耗状态
+            h2_cum=self.fc.operating_hours * 10  # 氢耗近似
+        )
 
     def _get_ems_obs(self, power_load):
-        """构建下层EMS观测"""
+        """构建下层EMS观测 (保持不变)"""
         return np.array([
             power_load / 1000.0,
             self.bat.SOC,
@@ -125,123 +127,92 @@ class HierarchicalUAVEnv:
             self.fc.current_power_act / 1000.0
         ], dtype=np.float32)
 
-    def _check_collision(self, pos):
-        """碰撞检测（保持原有逻辑，适配新的障碍物格式）"""
-        # 地面碰撞 (z > 0 表示在地面上方，但起飞高度z<0，所以z>0是坠地)
-        if pos[2] > 0:
-            return True
-
-        # 障碍物碰撞 (适配 [cx, cy, w, l, h] 长方体格式，与utils生成的格式一致)
-        for obs in self.obstacles:
-            cx, cy, w, l, h = obs
-            # NED坐标系: z越小越高, 高度低于楼顶即 pos[2] > -h
-            if (cx - w / 2 <= pos[0] <= cx + w / 2) and \
-               (cy - l / 2 <= pos[1] <= cy + l / 2) and \
-               (pos[2] > -h):
-                return True
-        return False
-
     def step(self, action=None):
         """
-        执行环境步进
-
-        关键修改：接受 action 参数用于训练，如果不传则使用 planner
+        执行上层步进 (1s)
         """
-        # ===== 修复 1: 正确处理动作输入 =====
+        # 1. 确定规划指令
         if action is not None:
-            # 训练模式：直接使用传入的动作 (numpy array)
-            action = np.array(action, dtype=np.float32)
-            if np.any(np.isnan(action)) or np.any(np.isinf(action)):
-                print(f"  [Warning] Invalid action: {action}")
-                action = np.zeros(3)
-            self.current_planned_vel = np.clip(action, -15.0, 15.0)
+            # 训练模式：接受 12 维状态对应的 3 维动作
+            self.current_planned_vel = np.clip(np.array(action), -15.0, 15.0)
         else:
-            # 推理模式：使用 planner
+            # 推理模式：调用 planner (SAC/AStar/APF)
             if self.planner is None:
-                raise ValueError("Planner not set for inference mode")
-            obs = self._get_planner_obs()
+                raise ValueError("Planner not set")
+
+            # 核心修改：通过 kwargs 将 power_load 传入推理侧
             self.current_planned_vel = self.planner.compute_velocity_command(
                 current_pos=self.uav.get_position(),
                 current_vel=self.uav.get_velocity(),
                 target_pos=self.target_pos,
                 obstacles=self.obstacles,
                 power_state={'soc': self.bat.SOC, 'h2_cum': self.fc.operating_hours * 10},
-                dt=self.planner_dt
+                dt=self.planner_dt,
+                power_load=self.last_p_load  # 跨层参数
             )
 
-        self.time_step += 1
-
-        # ===== 修复 2: 确保动作不为零导致坠落 =====
+        # 2. 指令保护
         if np.linalg.norm(self.current_planned_vel) < 0.1:
-            # 如果速度指令太小，给一个向上的力防止坠地
-            self.current_planned_vel[2] = -2.0  # 向上(z为负)
+            self.current_planned_vel[2] = -2.0  # 防止无指令坠落
 
-        # ===== 下层循环: 高频EMS步进 =====
+        self.time_step += 1
         ems_reward_accum = 0
+        step_p_load_accum = 0  # 用于计算该 planner_dt 内的平均功耗
 
+        # 3. 高频下层循环 (10 x 0.1s)
         for _ in range(self.substeps):
-            # UAV动力学
-            state, power_load = self.uav.step(self.current_planned_vel, self.ems_dt)
+            # 物理步进
+            state, p_load = self.uav.step(self.current_planned_vel, self.ems_dt)
             pos = self.uav.get_position()
+            step_p_load_accum += p_load
 
-            # 检查是否已坠地或碰撞（在子步骤中检查）
-            if self._check_collision(pos):
+            if check_collision(pos, self.obstacles):
                 break
 
-            # EMS决策
+            # EMS 决策
             if self.ems is not None:
-                ems_obs = self._get_ems_obs(power_load)
                 fc_power = self.ems.compute_fc_command(
-                    power_load, self.bat.SOC, self.ems_dt, future_load=None
+                    p_load, self.bat.SOC, self.ems_dt
                 )
             else:
-                # 默认EMS
-                fc_power = np.clip(power_load, 0, 500) if self.bat.SOC > 0.3 else 0
+                fc_power = np.clip(p_load, 0, 500) if self.bat.SOC > 0.3 else 0
 
-            # 执行能量管理
+            # 能量分配
             p_fc_act, h2_step = self.fc.step(fc_power, self.ems_dt)
-            p_bat_req = power_load - p_fc_act
+            p_bat_req = p_load - p_fc_act
             p_bat_act, soc_new, soh_new = self.bat.step(p_bat_req, self.ems_dt)
 
-            # 累计EMS奖励（氢耗惩罚 + SOC维持）
-            r_h2 = -h2_step * 10
-            r_soc = -abs(self.bat.SOC - 0.6) * 50
-            ems_reward_accum += (r_h2 + r_soc)
+            # 累计 EMS 奖励 (供上层感知能效)
+            ems_reward_accum += (-h2_step * 10 - abs(self.bat.SOC - 0.6) * 50)
 
-        # ===== 计算上层奖励和终止条件 =====
+        # 更新上一时刻平均功耗，供下一次 obs 使用
+        self.last_p_load = step_p_load_accum / self.substeps
+
+        # 4. 结算奖励与终止条件
         pos = self.uav.get_position()
         dist_to_target = np.linalg.norm(pos - self.target_pos)
-
-        reward = 0
+        reward = -dist_to_target * 0.01
         done = False
 
-        # 距离奖励（每步惩罚距离）
-        reward += -dist_to_target * 0.01
-
-        # 到达奖励
         if dist_to_target < 15.0:
-            reward += 200.0
+            reward += 500.0
             done = True
-            print(f"  [Episode Done] Arrived at target! Dist: {dist_to_target:.1f}m")
+            print(f"  [Done] Arrived! Dist: {dist_to_target:.1f}m")
 
-        # 碰撞惩罚
-        if self._check_collision(pos):
-            reward -= 10000
+        if check_collision(pos, self.obstacles):
+            reward -= 2000.0
             done = True
-            print(f"  [Episode Done] Collision/Out of bounds! Pos: {pos}")
+            print(f"  [Done] Collision! Pos: {pos}")
 
-        # SOC耗尽
         if self.bat.SOC < 0.15:
-            reward -= 10000
+            reward -= 2000.0
             done = True
-            print(f"  [Episode Done] Battery depleted! SOC: {self.bat.SOC:.2f}")
+            print(f"  [Done] Battery Depleted!")
 
-        # 超时
         if self.time_step >= self.max_steps:
             done = True
-            print(f"  [Episode Done] Max steps reached!")
 
-        # 能量效率奖励
+        # 加入能效反馈：上层奖励包含部分下层能耗表现
         reward += ems_reward_accum * 0.1
 
         obs = self._get_planner_obs()
@@ -250,7 +221,7 @@ class HierarchicalUAVEnv:
             'position': pos.copy(),
             'velocity': self.uav.get_velocity().copy(),
             'soc': self.bat.SOC,
-            'soh': self.bat.SOH,
+            'power_load': self.last_p_load,
             'h2_total': self.fc.operating_hours * 10
         }
 

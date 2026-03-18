@@ -1,6 +1,7 @@
 # utils.py
 import numpy as np
-
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 # 尝试导入 airsim，如果未安装则跳过，防止报错
 try:
     import airsim
@@ -245,72 +246,97 @@ def generate_city_blocks(n, start_pos, target_pos, min_building_dist, seed=None)
     return obs
 
 
-
-
-
-# ==========================================
-# 第二部分：AirSim 接口封装 (未来使用)
-# ==========================================
-
-class AirSimBridge:
+def plot_uav_path(start_pos, target_pos, obstacles, path_history, title="UAV Flight Path (Alt = -Z)"):
     """
-    负责与 AirSim 建立连接，并将飞行状态转换为功率数据
+    修正后的 3D 路径规划可视化函数
+    将 NED 坐标系转换成视觉直观的 Alt (高度) 坐标
     """
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
 
-    def __init__(self, ip="", port=41451, prop_coeff=1e-8, avionics_power=50.0):
-        if not AIRSIM_AVAILABLE:
-            raise ImportError("AirSim library not found. Please install using 'pip install airsim'")
+    # 定义转换函数：NED 中的 Z 转换成绘图中的高度 H (H = -Z)
+    def to_alt(z):
+        return -z
 
-        self.client = airsim.MultirotorClient(ip=ip, port=port)
-        self.prop_coeff = prop_coeff  # 螺旋桨功率系数 (需标定)
-        self.avionics_power = avionics_power  # 航电功耗 (W)
-        self.is_connected = False
+    # 1. 绘制起点和终点 (Z 取反)
+    ax.scatter(start_pos[0], start_pos[1], to_alt(start_pos[2]),
+               c='g', s=100, label='Start (Takeoff)', depthshade=False)
+    ax.scatter(target_pos[0], target_pos[1], to_alt(target_pos[2]),
+               c='r', s=150, label='Target (Landing)', marker='*', depthshade=False)
 
-    def connect(self):
-        try:
-            self.client.confirmConnection()
-            self.client.enableApiControl(True)
-            self.is_connected = True
-            print("[AirSimBridge] Connected successfully.")
-        except Exception as e:
-            print(f"[AirSimBridge] Connection failed: {e}")
-            self.is_connected = False
+    # 2. 绘制建筑物
+    for o in obstacles:
+        cx, cy, w, l, h = o
+        x_anchor = cx - w / 2
+        y_anchor = cy - l / 2
 
-    def get_current_power_demand(self):
-        """
-        获取当前时刻的功率需求 (W)
-        原理: P_total = sum(k * w^3) + P_avionics
-        """
-        if not self.is_connected:
-            return 0.0
+        # 在视觉直观图中：
+        # 底座在地面 (Z_visual = 0)
+        # 高度增加到 h (dZ_visual = h)
+        color = 'navy' if h > 150 else 'gray'
+        ax.bar3d(x_anchor, y_anchor, 0, w, l, h,
+                 color=color, alpha=0.4, edgecolor='k', linewidth=0.5)
 
-        # 获取电机状态
-        try:
-            rotor_states = self.client.getRotorStates()
-            total_prop_power = 0.0
+    # 3. 绘制飞行轨迹
+    if path_history is not None and len(path_history) > 0:
+        path = np.array(path_history)
+        # 将路径中的 Z 坐标全部取反
+        visual_path_z = to_alt(path[:, 2])
 
-            # 假设是4旋翼
-            for i in range(4):
-                # 获取转速 (AirSim 返回的通常是 rad/s 或 RPM，需根据模型确认)
-                # 这里假设返回的是 rad/s
-                w = rotor_states.rotors[i]['speed']
+        ax.plot(path[:, 0], path[:, 1], visual_path_z,
+                c='magenta', linewidth=2.5, label='Trajectory', alpha=0.9)
 
-                # 过滤极小值防止噪音
-                if w < 0: w = 0
+        # 标记当前终点位置
+        ax.scatter(path[-1, 0], path[-1, 1], visual_path_z[-1], c='orange', s=50)
 
-                # 机械功率 P = K * w^3
-                total_prop_power += self.prop_coeff * (w ** 3)
+    # 4. 视图设置
+    mid_x = (start_pos[0] + target_pos[0]) / 2
+    mid_y = (start_pos[1] + target_pos[1]) / 2
 
-            # 考虑电机效率 (如 85%) 转换为电功率
-            elec_power = total_prop_power / 0.85
+    # 动态调整显示范围
+    range_val = max(abs(target_pos[0] - start_pos[0]), abs(target_pos[1] - start_pos[1])) / 1.5 + 100
+    ax.set_xlim(mid_x - range_val, mid_x + range_val)
+    ax.set_ylim(mid_y - range_val, mid_y + range_val)
 
-            return elec_power + self.avionics_power
+    # 设置 Z 轴（高度）从 0 开始往上
+    ax.set_zlim(0, 300)
 
-        except Exception as e:
-            print(f"Error reading AirSim data: {e}")
-            return 0.0
+    ax.set_xlabel('North (X) [m]')
+    ax.set_ylabel('East (Y) [m]')
+    ax.set_zlabel('Altitude (-Z) [m]')  # 明确标注 Z 轴已取反
+    ax.set_title(title)
+    ax.legend()
 
-    def land_vehicle(self):
-        """紧急降落指令"""
-        if self.is_connected:
-            self.client.landAsync()
+    ax.view_init(elev=25, azim=-135)  # 调整到一个更好的观察角度
+    plt.show()
+
+
+
+def check_collision(pos: np.ndarray, obstacles: list) -> bool:
+    """
+    通用碰撞检测函数 (NED 坐标系)
+    :param pos: 无人机当前位置 [x, y, z]
+    :param obstacles: 障碍物列表，每个元素为 [cx, cy, w, l, h]
+    :return: True 表示碰撞，False 表示安全
+    """
+    # 1. 地面碰撞检测
+    # NED坐标系中，Z轴向下为正，地面为 Z=0。因此 Z > 0 表示进入地下或触地
+    if pos[2] > 0:
+        return True
+
+    # 2. 建筑物碰撞检测
+    for obs in obstacles:
+        cx, cy, w, l, h = obs
+
+        # 计算 AABB (轴对齐包围盒) 边界
+        xmin, xmax = cx - w / 2, cx + w / 2
+        ymin, ymax = cy - l / 2, cy + l / 2
+
+        # 建筑物顶部在 NED 中的坐标是 -h (因为高度是向上，即负方向)
+        # 如果 Z > -h，说明无人机的高度低于楼顶
+        if (xmin <= pos[0] <= xmax) and \
+                (ymin <= pos[1] <= ymax) and \
+                (pos[2] > -h):
+            return True
+
+    return False

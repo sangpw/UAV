@@ -4,218 +4,192 @@ import os
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
-# 导入你的环境和算法
+# 导入环境、算法和工具函数
 from envs.urban_env import UrbanPlanningEnv
-from rl_core import SAC, ReplayBuffer
+from rl_core import SAC, ReplayBuffer, ObservationBuilder
+from utils import check_collision  # 确保导入了统一的碰撞检测
 
 
 # ==========================================
-# 0. 辅助函数：安全的模型保存逻辑
+# 1. 增强型环境包装器 (加入能量感知与高度保护)
 # ==========================================
-def safe_save_model(agent, prefix):
-    """
-    安全保存模型，增加异常处理，防止保存失败导致训练中断。
-    """
-    try:
-        # 1. 保存 Actor (推理必须)
-        torch.save(agent.actor.state_dict(), f"{prefix}_actor.pth")
-
-        # 2. 保存 Critics (如果想恢复训练需要)
-        try:
-            torch.save(agent.critic_1.state_dict(), f"{prefix}_critic_1.pth")
-            torch.save(agent.critic_2.state_dict(), f"{prefix}_critic_2.pth")
-        except AttributeError:
-            # 如果 rl_core 写法不同，可能叫 critic，这里做个兼容
-            if hasattr(agent, 'critic'):
-                torch.save(agent.critic.state_dict(), f"{prefix}_critic.pth")
-
-    except Exception as e:
-        # 捕获异常，打印错误日志但不中断训练
-        print(f"  >>> [Warning] 模型保存失败 ({prefix})! 错误信息: {e}")
-
-
-# ==========================================
-# 1. 环境包装器 (关键：归一化 + 奖励重塑)
-# ==========================================
-class NormalizedEnvWrapper(gym.Wrapper):
+class EnergyAwareWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.scale_pos = 1000.0  # 地图大概 1000m
-        self.scale_vel = 15.0  # 最大速度
-
-        # 记录上一步距离，用于计算引导奖励
+        self.scale_pos = 1000.0
+        self.scale_vel = 15.0
+        self.scale_pwr = 1000.0  # 功率归一化基准
         self.last_dist = None
+        self.obs_builder = ObservationBuilder()
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.last_dist = np.linalg.norm(info['target'] - info['position'])
-        return self._normalize_obs(obs), info
+        return self._normalize_obs(obs, info), info
 
     def step(self, action):
-        # 1. 动作缩放: 网络输出[-1, 1] -> 环境[-15, 15]
+        # 1. 动作映射 [-1, 1] -> [-15, 15]
         rescaled_action = action * 15.0
 
-        # 2. 环境步进
-        next_obs, original_reward, terminated, truncated, info = self.env.step(rescaled_action)
+        # 2. 执行环境步进
+        next_obs, reward, terminated, truncated, info = self.env.step(rescaled_action)
 
-        # 3. 奖励重塑 (Reward Shaping) - 修复收敛慢的核心
-        curr_dist = np.linalg.norm(info['target'] - info['position'])
+        # 3. 跨层奖励重塑 (Reward Shaping)
+        curr_pos = info['position']
+        curr_dist = np.linalg.norm(info['target'] - curr_pos)
 
-        # (a) 进度引导奖励: 靠近给正分，远离给负分 (系数下调至 10.0，使单步奖励平滑)
-        reward_progress = (self.last_dist - curr_dist) * 10.0
+        # (a) 进度奖励 (引导向目标飞行)
+        reward_progress = (self.last_dist - curr_dist) * 15.0
 
-        # (b) 移除原有的绝对距离惩罚 (解决模型故意去撞墙的“自杀悖论”)
-        # reward_dist = -curr_dist * 0.005  <-- 已删除
+        # (b) 能量消耗惩罚 (感知下层EMS)
+        # 假设 info['power_state'] 包含了当前功耗 p_load
+        p_load = info.get('power_load', 500.0)  # 兜底值
+        reward_energy = -(p_load / self.scale_pwr) * 0.5
 
-        # (c) 生存/耗时惩罚: 鼓励尽快到达，不要绕圈子 (加大惩罚力度)
-        reward_step = -0.5
+        # (c) 高度与边界保护 (防止撞地)
+        reward_safety = 0
+        if curr_pos[2] > -5.0:  # 距离地面不足5米时开始警告惩罚
+            reward_safety = -2.0
+        if curr_pos[2] > 0:  # 彻底撞地
+            reward_safety = -50.0
 
-        # (d) 稀疏大奖励: 明确终点目标与失败后果
-        reward_terminal = 0.0
+        # (d) 终端奖励
+        reward_terminal = 0
         if terminated:
-            if curr_dist < 20.0:  # 成功到达
-                reward_terminal = 500.0  # 必须远大于存活期间可能扣除的总分
-                print(f"  >>> [Success] Reached Target! Dist: {curr_dist:.1f}")
-            else:  # 撞墙/撞地
-                reward_terminal = -200.0  # 严厉惩罚撞墙行为
+            if curr_dist < 15.0:
+                reward_terminal = 1000.0
+                print(f"  >>> [Success] Arrived! H2: {info['power_state']['h2_cum']:.2f}g")
+            else:
+                reward_terminal = -500.0  # 碰撞惩罚
 
-        # 总奖励
-        reward = reward_progress + reward_step + reward_terminal
+        # 综合奖励 (权重：进度 > 终端 > 能量 > 安全)
+        total_reward = reward_progress + reward_energy + reward_safety + reward_terminal
 
-        # 更新距离
         self.last_dist = curr_dist
+        norm_obs = self._normalize_obs(next_obs, info)
 
-        # 4. 观测归一化
-        norm_obs = self._normalize_obs(next_obs)
+        return norm_obs, total_reward, terminated, truncated, info
 
-        return norm_obs, reward, terminated, truncated, info
-
-    def _normalize_obs(self, obs):
+    def _normalize_obs(self, obs, info):
         """
-        obs结构:[pos(3), vel(3), error(3), soc, h2]
+        构建增强版状态向量: [pos(3), vel(3), error(3), soc, p_load, h2]
+        维度: 12
         """
-        new_obs = np.array(obs, dtype=np.float32).copy()
-        new_obs[0:3] /= self.scale_pos
-        new_obs[3:6] /= self.scale_vel
-        new_obs[6:9] /= self.scale_pos
-        return new_obs
+        pos = info['position']
+        vel = info['velocity']
+        error = info['target'] - pos
+        soc = info['power_state']['soc']
+        h2 = info['power_state']['h2_cum']
+        p_load = info.get('power_load', 500.0)
+
+        norm_obs = np.concatenate([
+            pos / self.scale_pos,
+            vel / self.scale_vel,
+            error / self.scale_pos,
+            [soc],
+            [p_load / self.scale_pwr],
+            [h2 / 100.0]
+        ]).astype(np.float32)
+        return norm_obs
 
 
 # ==========================================
 # 2. 训练主循环
 # ==========================================
 def train():
-    # 配置参数
-    MAX_EPISODES = 2000
-    MAX_STEPS = 400
+    # 参数配置
+    MAX_EPISODES = 3000  # 增加回合数以适应更复杂的状态空间
+    MAX_STEPS = 500
     BATCH_SIZE = 256
-    START_STEPS = 2000  # 预热步数 (保持 2000 即可)
+    START_STEPS = 5000  # 初始随机探索步数
 
-    # 初始化环境
-    raw_env = UrbanPlanningEnv(
-        num_obstacles=15,
-        fixed_map=True,
-        map_seed=42
-    )
-    env = NormalizedEnvWrapper(raw_env)
+    save_dir = "./models/SAC"
+    os.makedirs(save_dir, exist_ok=True)
 
-    # 初始化 SAC
-    state_dim = env.observation_space.shape[0]
+    # 初始化环境 (fixed_map=False 增加泛化性)
+    raw_env = UrbanPlanningEnv(num_obstacles=15, fixed_map=False)
+    env = EnergyAwareWrapper(raw_env)
+
+    # 自动获取状态维度 (现在应该是 12)
+    state_dim = 12
     action_dim = env.action_space.shape[0]
-    max_action = 1.0
+
+    print(f"Training Start. State Dim: {state_dim}, Action Dim: {action_dim}")
 
     agent = SAC(
         state_dim=state_dim,
         action_dim=action_dim,
-        max_action=max_action,
+        max_action=1.0,
         lr=3e-4,
-        gamma=0.99,
+        gamma=0.98,  # 略微调低衰减率，让它更看重近期收益
         tau=0.005,
-        alpha=0.05  # <--- 核心修改: 降低探索参数(原0.2)，减少模型动作抖动，加速收敛
+        alpha=0.1,  # 适中的探索温度
+        auto_tune_alpha=True
     )
 
     replay_buffer = ReplayBuffer(state_dim, action_dim, max_size=1000000)
 
-    # 记录
     reward_history = []
-    avg_reward_history = []
-    success_count = 0
+    success_record = []  # 记录最近100次成功率
+
     total_steps = 0
-    max_episode_steps = 0
-
-    save_dir = "./models/SAC"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
-
-    print(f"Start Training SAC... State Dim: {state_dim}, Action Dim: {action_dim}")
 
     for episode in range(MAX_EPISODES):
-        state, info = env.reset(seed=np.random.randint(0, 1000))
+        # 每次重置使用不同的种子，生成不同的随机地图
+        state, info = env.reset(seed=episode)
         episode_reward = 0
-        episode_success = False
 
         for t in range(MAX_STEPS):
             total_steps += 1
 
-            # 选择动作
+            # 动作选择
             if total_steps < START_STEPS:
-                action = env.action_space.sample() / 15.0
+                action = env.action_space.sample()
             else:
-                action = agent.select_action(state, deterministic=False)
+                action = agent.select_action(state)
 
-            # 执行动作
+            # 执行步进
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            # <--- 核心修改: 加入 Buffer 时对 reward 进行缩放，防止神经网络 Q 值爆炸
-            # 注意：只是存进池子里的缩小了，打印和画图用的 episode_reward 还是真实的直观分数
-            scaled_reward = reward * 0.1
-            replay_buffer.add(state, action, next_state, scaled_reward, float(terminated))
+            # 存储经验 (Reward 缩放有助于稳定训练)
+            replay_buffer.add(state, action, next_state, reward * 0.1, float(terminated))
 
             state = next_state
             episode_reward += reward
 
-            # 模型更新
+            # 训练步
             if total_steps >= START_STEPS:
-                agent.train(replay_buffer, batch_size=BATCH_SIZE)
+                agent.train(replay_buffer, BATCH_SIZE)
 
             if done:
-                dist = np.linalg.norm(info['target'] - info['position'])
-                if dist < 20.0:
-                    success_count += 1
-                    episode_success = True
+                success = 1 if (info['distance'] < 20.0) else 0
+                success_record.append(success)
                 break
 
-        # 结算本回合的生存步数，并更新全局最大步数
-        current_episode_steps = t + 1
-        if current_episode_steps > max_episode_steps:
-            max_episode_steps = current_episode_steps
-
-        # 记录与打印
         reward_history.append(episode_reward)
-        avg_reward = np.mean(reward_history[-50:])
-        avg_reward_history.append(avg_reward)
 
+        # 打印进度
         if (episode + 1) % 10 == 0:
-            print(
-                f"Ep: {episode + 1} | Reward: {episode_reward:.1f} | Avg: {avg_reward:.1f} | Total Steps: {total_steps} | Max Steps: {max_episode_steps} | Success: {success_count}")
+            avg_r = np.mean(reward_history[-10:])
+            sr = np.mean(success_record[-50:]) if success_record else 0
+            print(f"Ep: {episode + 1} | Steps: {total_steps} | AvgReward: {avg_r:.1f} | SuccessRate: {sr:.2%}")
 
-        # 模型保存逻辑
-        if episode_success:
-            safe_save_model(agent, f"{save_dir}/sac_latest_success")
-            print(f"  -> [Saved] 最优模型已更新 (Ep: {episode + 1})")
+        # 定期保存与最优保存
+        if len(success_record) > 0 and success_record[-1] == 1:
+            if episode_reward >= max(reward_history if reward_history else [-inf]):
+                agent.save(f"{save_dir}/sac_best")
 
-        if (episode + 1) % 50 == 0:
-            safe_save_model(agent, f"{save_dir}/sac_ep{episode + 1}")
-            print(f"  -> [Saved] 周期模型已存档 (Ep: {episode + 1})")
+        if (episode + 1) % 100 == 0:
+            agent.save(f"{save_dir}/sac_ep{episode + 1}")
 
-    # 绘图
-    plt.plot(avg_reward_history)
-    plt.title("SAC Training Curve")
+    # 绘制训练曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(reward_history)
+    plt.title("SAC Energy-Aware Training")
     plt.xlabel("Episode")
-    plt.ylabel("Average Reward")
-    plt.savefig("training_curve.png")
-    plt.show()
+    plt.ylabel("Reward")
+    plt.savefig("sac_training.png")
 
 
 if __name__ == "__main__":

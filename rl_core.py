@@ -385,3 +385,34 @@ class SAC:
         if self.auto_tune_alpha:
             self.log_alpha = torch.load(filename + "_log_alpha", map_location=self.device)
             self.alpha = self.log_alpha.exp().item()
+
+
+class ObservationBuilder:
+    """
+    统一的观测向量构造器，确保训练和推理时的特征工程完全一致。
+    维度：12
+    结构：[pos(3), vel(3), error(3), soc(1), p_load(1), h2(1)]
+    """
+
+    def __init__(self):
+        self.scale_pos = 1000.0  # 坐标/距离缩放
+        self.scale_vel = 15.0  # 速度缩放
+        self.scale_pwr = 1000.0  # 功率缩放
+        self.scale_h2 = 100.0  # 累计氢耗缩放
+        self.state_dim = 12
+
+    def build(self, pos, vel, target, soc, p_load, h2_cum):
+        # 1. 计算相对距离向量 (NED: target - current)
+        error = np.array(target) - np.array(pos)
+
+        # 2. 归一化拼接
+        obs = np.concatenate([
+            np.array(pos) / self.scale_pos,  # 0,1,2: 当前位置
+            np.array(vel) / self.scale_vel,  # 3,4,5: 当前速度
+            error / self.scale_pos,  # 6,7,8: 目标误差
+            [float(soc)],  # 9: 电池电量 (0-1)
+            [float(p_load) / self.scale_pwr],  # 10: 瞬时功耗
+            [float(h2_cum) / self.scale_h2]  # 11: 累计燃料消耗
+        ]).astype(np.float32)
+
+        return obs
