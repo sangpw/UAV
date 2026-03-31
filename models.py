@@ -1,75 +1,108 @@
 import numpy as np
 from typing import Tuple, Dict
 
+import numpy as np
+
+
 class FuelCellStack:
     """
-    燃料电池物理模型
-    包含：极化曲线、动态响应滞后(Slew Rate)、寿命衰退
+    燃料电池电堆模型
+    包含：极化曲线计算、动态响应滞后、寿命衰退
+    适用于能量管理算法仿真验证
     """
 
     def __init__(self, num_cells=50, cell_area=100, max_slew_rate=20.0):
-        self.N = num_cells
-        self.A = cell_area
-        self.max_slew_rate = max_slew_rate  # W/s
+        self.N = num_cells  # 单体电池数量
+        self.A = cell_area  # 单体电池有效面积 cm²
+        self.max_slew_rate = max_slew_rate  # 最大功率变化率 W/s
 
-        # 物理状态
-        self.current_power_act = 0.0
-        self.operating_hours = 0.0
+        # 工作状态变量
+        self.current_power_act = 0.0  # 当前实际输出功率
+        self.operating_hours = 0.0  # 累计运行时长 h
 
-        # 电化学参数 (Amphlett模型简化)
-        self.T = 333  # K
-        self.R_int = 0.0003
-        self.B = 0.016
-        self.deg_rate = 1e-5  # V/h
+        # 电化学模型固定参数
+        self.T = 343.15  # 电堆工作温度 K
+        self.R = 8.3143  # 通用气体常数
+        self.F = 96485  # 法拉第常数
+        self.alpha = 0.5  # 电荷转移系数
+        self.i0 = 1e-3  # 交换电流密度 A/cm²
+        self.R_int = 0.0003  # 欧姆内阻 Ω·cm²
+        self.B = 0.016  # 浓差极化系数
+        self.i_lim = 1.2  # 极限电流密度 A/cm²
+        self.E0 = 1.229  # 标准状态下可逆电压
 
-    def get_voltage(self, current_density):
-        """内部计算：根据电流密度算电压"""
-        i = max(current_density, 1e-4)
-        E_nernst = 1.229 - 0.85e-3 * (self.T - 298.15)
-        v_act = 0.9514 - 0.00312 * self.T - 0.000187 * self.T * np.log(i)
-        v_act = max(0, 0.2 + 0.05 * np.log(i / 0.001))
-        v_ohm = i * self.R_int * 300
-        v_conc = self.B * np.log(1 - i / 1.5)
-        if np.isnan(v_conc): v_conc = 1.0
+        # 寿命衰退参数
+        self.deg_rate = 1e-5  # 电压衰退速率 V/h
 
-        v_cell = E_nernst - v_act - v_ohm + v_conc
+    def get_voltage(self, i):
+        """
+        计算单体电池输出电压
+        i：电流密度 A/cm²
+        """
+        # 限制电流密度在有效区间内
+        i = np.clip(i, 1e-4, self.i_lim - 1e-3)
+
+        # 计算能斯特开路电压
+        E_nernst = self.E0 - 0.85e-3 * (self.T - 298.15)
+
+        # 计算活化极化过电势
+        v_act = (self.R * self.T / (self.alpha * self.F)) * np.log(i / self.i0)
+
+        # 计算欧姆极化过电势
+        v_ohm = i * self.R_int
+
+        # 计算浓差极化过电势
+        v_conc = self.B * np.log(self.i_lim / (self.i_lim - i))
+
+        # 计算理论单体电压
+        v_cell = E_nernst - v_act - v_ohm - v_conc
+
+        # 计算寿命衰退导致的电压损失
         v_deg = self.deg_rate * self.operating_hours
-        return max(0, v_cell - v_deg)
+
+        # 返回最终单体电压，设置最小输出限制
+        return max(0.1, v_cell - v_deg)
 
     def step(self, power_cmd, dt):
         """
-        物理步进
-        :param power_cmd: 控制器给出的功率指令 (W)
-        :param dt: 时间步长 (s)
-        :return: (实际功率, 氢耗量g)
+        单步动态仿真
+        :param power_cmd: 功率指令 W
+        :param dt: 仿真步长 s
+        :return: 实际输出功率 W, 氢气消耗量 g
         """
-        # 1. 动态滞后模拟 (Slew Rate Limit)
+        # 功率动态变化率约束
         power_diff = power_cmd - self.current_power_act
         max_change = self.max_slew_rate * dt
-
         if abs(power_diff) <= max_change:
             self.current_power_act = power_cmd
         else:
             self.current_power_act += np.sign(power_diff) * max_change
 
-        # 2. 计算电流和氢耗
-        v_guess = self.N * 0.7
-        i_act = 0
-        # 简单迭代反解电流
-        for _ in range(3):
-            if v_guess < 0.1: v_guess = 1.0
-            i_total = self.current_power_act / v_guess
-            i_dens = min(i_total / self.A, 1.5)
-            v_single = self.get_voltage(i_dens)
-            v_guess = v_single * self.N
-            i_act = i_total
+        # 限制输出功率非负
+        self.current_power_act = max(0.0, self.current_power_act)
 
-        # 3. 寿命统计
-        if self.current_power_act > 10:
+        # 低功率工况直接返回零输出
+        P = self.current_power_act
+        if P < 1.0:
+            return 0.0, 0.0
+
+        # 迭代求解电堆工作电流与电压
+        v_stack = self.N * 0.65
+        i_total = 0.0
+        for _ in range(5):
+            i_total = P / v_stack if v_stack > 0 else 0.0
+            i_dens = i_total / self.A
+            v_single = self.get_voltage(i_dens)
+            v_stack = v_single * self.N
+
+        # 累计有效运行时长
+        if P > 5:
             self.operating_hours += dt / 3600.0
 
-        h2_grams = (self.N * i_act * 2.016) / (2 * 96485) * dt
-        return self.current_power_act, h2_grams
+        # 计算氢气消耗量
+        h2_grams = (self.N * i_total * 2.016) / (2 * self.F) * dt
+
+        return self.current_power_act, max(0, h2_grams)
 
 
 class LithiumBattery:
