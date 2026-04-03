@@ -1,5 +1,6 @@
 # utils.py
 import numpy as np
+from math import inf
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 # 尝试导入 airsim，如果未安装则跳过，防止报错
@@ -340,3 +341,48 @@ def check_collision(pos: np.ndarray, obstacles: list) -> bool:
             return True
 
     return False
+
+
+def compute_hierarchical_reward(info, prev_info, action, terminated, truncated):
+    # 1. 时间与进度奖励 (目标：最短时间)
+    curr_dist = info['distance']
+    prev_dist = prev_info['distance']
+    reward_progress = (prev_dist - curr_dist) * 15.0  # 进度
+    reward_time = -2.0  # 步时长惩罚 (鼓励尽快到达)
+
+    # 2. 能量消耗奖励 (目标：最少能耗)
+    # 计算当前步的氢气消耗 (g)
+    h2_step = info['h2_total'] - prev_info['h2_total']
+    reward_energy = -h2_step * 500.0  # 权重需根据H2价格与时间的价值折算
+
+    # 3. 寿命损耗惩罚 (目标：燃料电池耐久性)
+    # 从 info 中获取燃料电池当前功率 (需确保 env.step 返回此信息)
+    curr_p_fc = info.get('fc_power', 0.0)
+    prev_p_fc = prev_info.get('fc_power', 0.0)
+
+    # (a) 功率变动率惩罚 (防止剧烈震荡)
+    p_slew_rate = abs(curr_p_fc - prev_p_fc)
+    reward_health = -0.05 * (p_slew_rate ** 2)
+
+    # (b) 电池健康平衡 (防止深充深放)
+    reward_soc = -50.0 * (abs(info['soc'] - 0.6) ** 2)
+
+    # 4. 安全与终端奖励
+    reward_terminal = 0
+    if terminated:
+        if curr_dist < 15.0:
+            reward_terminal = 2000.0  # 大额成功奖
+        else:
+            reward_terminal = -2000.0  # 碰撞重罚
+
+    # 5. 统筹求和
+    total_reward = (
+            reward_progress +  # 引导
+            reward_time +  # 促使快
+            reward_energy +  # 促使省
+            reward_health +  # 促使稳(寿命)
+            reward_soc +  # 促使续航稳定
+            reward_terminal  # 促使安全
+    )
+
+    return total_reward

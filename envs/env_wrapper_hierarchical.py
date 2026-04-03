@@ -26,7 +26,7 @@ class HierarchicalUAVEnv:
                  target_pos: np.ndarray = np.array([800., 600., -100.]),
                  num_obstacles: int = 15,
                  fixed_map: bool = True,
-                 map_seed: int = 42,
+                 map_seed: int =42,
                  min_building_dist: float = 30.0):
 
         self.planner_dt = planner_dt

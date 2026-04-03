@@ -1,3 +1,4 @@
+#evaluate_system.py
 import numpy as np
 from envs.env_wrapper_hierarchical import HierarchicalUAVEnv
 from controllers.planner import SACPlanner, RuleBasedPlanner, AStarPlanner
@@ -60,7 +61,7 @@ def evaluate_combination(planner_name, ems_name, planner_model_path=None, ems_mo
 
 if __name__ == "__main__":
     # 您需要提前通过 train_sac.py 和 train_td3.py 获得这两个 pth 文件
-    sac_path = "models/SAC/sac_best_actor"
+    sac_path = "models/SAC/sac_ep500_actor"
     td3_path = "models/TD3/td3_latest_success_actor.pth"
 
     #--- 对比实验组设计 ---
