@@ -45,7 +45,7 @@ def evaluate_combination(planner_name, ems_name, planner_model_path=None, ems_mo
 
     print(f"[{planner_name} + {ems_name}] Test Finished.")
     print(f"Distance to target: {info['distance']:.2f} m")
-    print(f"Final SOC: {info['soc']:.4f}, H2 Consumption: {info['h2_total']:.4f} g")
+    print(f"Final SOC: {info['soc']:.4f}, H2 Consumption: {info['h2_total']:.4f} g, SOH: {info['SOH']:.4f} h")
 
     plot_uav_path(
         start_pos=env.start_pos,
